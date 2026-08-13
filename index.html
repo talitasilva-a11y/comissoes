@@ -728,7 +728,9 @@ function showSetupScreen(){
 }
 function hideSetupScreen(){
   document.getElementById("setupScreen").classList.add("hidden");
-  document.getElementById("loginScreen").classList.remove("hidden");
+  if(!CURRENT_USER){
+    document.getElementById("loginScreen").classList.remove("hidden");
+  }
 }
 
 /* ============================================================
