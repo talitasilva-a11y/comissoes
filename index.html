@@ -175,6 +175,7 @@ input.text-input{padding:11px 14px;font-weight:500;}
 .pill{display:inline-block;font-size:11px;font-weight:800;padding:3px 9px;border-radius:100px;}
 .pill.yes{background:rgba(112,99,240,0.14);color:var(--purple-deep);}
 .pill.no{background:rgba(229,72,77,0.12);color:var(--danger);}
+.muted-tag{font-size:10.5px;color:var(--ink-faint);font-weight:700;text-transform:uppercase;letter-spacing:.03em;}
 
 /* ---- Breakdown table ---- */
 .card{background:#fff;border-radius:18px;box-shadow:var(--shadow);border:1px solid var(--line);padding:20px;margin-bottom:20px;}
@@ -319,13 +320,20 @@ const CONFIG = {
     ELEGIBILIDADE_MONITORIA_PCT: 80,
     SATISFACAO_MIN: 90,
     NPS_MIN: 4.0,
+    TAXA_RESOLUCAO_MIN: 90,
     MONITORIA_94: 94,
     MONITORIA_90: 90,
     MONITORIA_85: 85,
     MONITORIA_80: 80
   },
   CICLO_DIAS: 30,
-  MAX_FALTAS_TOLERADAS: 1 // 2 ou mais faltas = inelegível
+  MAX_FALTAS_TOLERADAS: 1, // 2 ou mais faltas = inelegível
+
+  // A partir deste ciclo (inclusive), o NPS sai da composição da comissão e entra
+  // a Taxa de Resolução (meta 90%) em seu lugar. Formato: "AAAA-MM", onde MM é o
+  // mês final do ciclo (ex: ciclo 16/ago a 15/set/2026 = "2026-09").
+  // Ciclos anteriores a este continuam usando NPS normalmente.
+  REGRA_NOVA_DESDE: "2026-09"
 };
 
 /* ============================================================
@@ -416,6 +424,10 @@ function cicloSortKey(ciclo){
   if(!ym) return ciclo;
   return ym.ano.toString().padStart(4,"0") + "-" + ym.mes.toString().padStart(2,"0");
 }
+function usaNovaRegra(ciclo){
+  // true = ciclo usa Taxa de Resolução (meta 90%) no lugar do NPS
+  return cicloSortKey(ciclo) >= CONFIG.REGRA_NOVA_DESDE;
+}
 function fmtCiclo(ciclo){
   // aceita "2025-01" ou "01/2025" -> "16/dez a 15/jan · 2025"
   const meses = ["jan","fev","mar","abr","mai","jun","jul","ago","set","out","nov","dez"];
@@ -438,6 +450,7 @@ const HEADER_MAP = {
   ligacoesatingida:"ligacoesAtingida", ligacoes:"ligacoesAtingida", qtdligacoes:"ligacoesAtingida",
   satisfacao:"satisfacao", satisfacaopct:"satisfacao",
   nps:"nps",
+  taxaresolucao:"taxaResolucao", taxaderesolucao:"taxaResolucao", resolucao:"taxaResolucao", taxaresolucaopct:"taxaResolucao",
   monitoria:"monitoria", monitoriapct:"monitoria",
   retencoes:"retencoes", retencao:"retencoes", qtdretencoes:"retencoes",
   diastrabalhados:"diasTrabalhados",
@@ -531,12 +544,13 @@ function processRows(rawData){
       nome: (rec.nome||"").trim(),
       pin: (rec.pin||"").toString().trim(),
       ciclo: (rec.ciclo||"").trim(),
-      metaPontuacao: parseInteiro(rec.metaPontuacao),
-      pontuacaoAtingida: parseInteiro(rec.pontuacaoAtingida),
+      metaPontuacao: parseDecimal(rec.metaPontuacao),
+      pontuacaoAtingida: parseDecimal(rec.pontuacaoAtingida),
       metaLigacoes: parseInteiro(rec.metaLigacoes),
       ligacoesAtingida: parseInteiro(rec.ligacoesAtingida),
       satisfacao: parseDecimal(rec.satisfacao),
       nps: parseDecimal(rec.nps),
+      taxaResolucao: parseDecimal(rec.taxaResolucao),
       monitoria: parseDecimal(rec.monitoria),
       retencoes: parseInteiro(rec.retencoes),
       diasTrabalhados: parseInteiro(rec.diasTrabalhados) || CONFIG.CICLO_DIAS,
@@ -571,6 +585,7 @@ function calcularComissao(r){
   if(r.monitoria < L.ELEGIBILIDADE_MONITORIA_PCT) reasons.push("Monitoria abaixo de 80%");
   if(r.medidaDisciplinar) reasons.push("Recebeu medida disciplinar no período");
   const eligible = reasons.length === 0;
+  const novaRegra = usaNovaRegra(r.ciclo);
 
   let valorPontuacao=0, valorLigacoes=0, valorSatisfacao=0, valorNPS=0;
   let monitoriaAjuste=0, valorRetencao=0, valorSuperacao=0;
@@ -579,7 +594,10 @@ function calcularComissao(r){
     valorPontuacao = pctPontuacao >= 1 ? V.PONTUACAO : 0;
     valorLigacoes = pctLigacoes >= 1 ? V.LIGACOES : 0;
     valorSatisfacao = r.satisfacao >= L.SATISFACAO_MIN ? V.SATISFACAO : 0;
-    valorNPS = r.nps >= L.NPS_MIN ? V.NPS : 0;
+    // Até o ciclo anterior a REGRA_NOVA_DESDE: NPS (meta 4,0). A partir dele: Taxa de Resolução (meta 90%).
+    valorNPS = novaRegra
+      ? (r.taxaResolucao >= L.TAXA_RESOLUCAO_MIN ? V.NPS : 0)
+      : (r.nps >= L.NPS_MIN ? V.NPS : 0);
 
     const subtotalIndicadores = valorPontuacao + valorLigacoes + valorSatisfacao + valorNPS;
 
@@ -602,7 +620,7 @@ function calcularComissao(r){
   return {
     proporcao, metaPontuacaoProp, metaLigacoesProp,
     pctPontuacao, pctLigacoes,
-    eligible, reasons,
+    eligible, reasons, novaRegra,
     valorPontuacao, valorLigacoes, valorSatisfacao, valorNPS,
     subtotalIndicadores, monitoriaAjuste, valorRetencao, valorSuperacao,
     total, faltamPontos, faltamLigacoes
@@ -840,13 +858,16 @@ function renderAgentView(){
   const pctPont = metaPontuacaoProp>0 ? pontuacaoAtingida/metaPontuacaoProp : 0;
   const pctLig = metaLigacoesProp>0 ? ligacoesAtingida/metaLigacoesProp : 0;
 
-  // KPIs adicionais só fazem sentido no ciclo único (satisfação/NPS/monitoria/retenções são por ciclo)
+  // KPIs adicionais só fazem sentido no ciclo único (satisfação/NPS ou Taxa de Resolução/monitoria/retenções são por ciclo)
   let extraKpis = "";
   if(sel !== "__all__"){
     const r = agent.ciclos.find(x=>x.ciclo===sel);
+    const quartoIndicadorKpi = r.calc.novaRegra
+      ? kpiCard("Taxa de Resolução", r.taxaResolucao.toFixed(1)+"%", r.taxaResolucao>=CONFIG.LIMIARES.TAXA_RESOLUCAO_MIN ? "Meta atingida (≥90%)" : "Abaixo da meta (≥90%)")
+      : kpiCard("NPS", r.nps.toFixed(1), r.nps>=CONFIG.LIMIARES.NPS_MIN ? "Meta atingida (≥4,0)" : "Abaixo da meta (≥4,0)");
     extraKpis = `
       ${kpiCard("Satisfação", r.satisfacao.toFixed(1)+"%", r.satisfacao>=CONFIG.LIMIARES.SATISFACAO_MIN ? "Meta atingida (≥90%)" : "Abaixo da meta (≥90%)")}
-      ${kpiCard("NPS", r.nps.toFixed(1), r.nps>=CONFIG.LIMIARES.NPS_MIN ? "Meta atingida (≥4,0)" : "Abaixo da meta (≥4,0)")}
+      ${quartoIndicadorKpi}
       ${kpiCard("Monitoria", r.monitoria.toFixed(1)+"%", r.monitoria>=94?"Bônus fixo de R$ 150,00" : r.monitoria>=90?"Bônus fixo de R$ 100,00" : r.monitoria>=85?"Penalidade de 10% sobre indicadores" : r.monitoria>=80?"Penalidade de 20% sobre indicadores" : "Abaixo de 80% — sem comissão")}
       ${kpiCard("Retenções", r.retencoes.toFixed(0), brl(r.retencoes*CONFIG.VALORES.RETENCAO) + " no ciclo")}
     `;
@@ -855,13 +876,14 @@ function renderAgentView(){
   let breakdownHtml = "";
   if(sel !== "__all__"){
     const c = calc;
+    const rotuloQuartoIndicador = c.novaRegra ? "Taxa de Resolução" : "NPS";
     breakdownHtml = `<div class="card">
       <h3>Composição da comissão</h3>
       <table class="breakdown">
         <tr><td>Pontuação</td><td class="val">${brl(c.valorPontuacao)}</td></tr>
         <tr><td>Ligações</td><td class="val">${brl(c.valorLigacoes)}</td></tr>
         <tr><td>Satisfação</td><td class="val">${brl(c.valorSatisfacao)}</td></tr>
-        <tr><td>NPS</td><td class="val">${brl(c.valorNPS)}</td></tr>
+        <tr><td>${rotuloQuartoIndicador}</td><td class="val">${brl(c.valorNPS)}</td></tr>
         <tr><td>Ajuste de monitoria</td><td class="val ${c.monitoriaAjuste<0?'neg':c.monitoriaAjuste>0?'pos':''}">${brl(c.monitoriaAjuste)}</td></tr>
         <tr><td>Retenções</td><td class="val pos">${brl(c.valorRetencao)}</td></tr>
         <tr><td>Superação de meta</td><td class="val pos">${brl(c.valorSuperacao)}</td></tr>
@@ -876,7 +898,7 @@ function renderAgentView(){
         <tr><td>Pontuação (soma)</td><td class="val">${brl(c.valorPontuacao)}</td></tr>
         <tr><td>Ligações (soma)</td><td class="val">${brl(c.valorLigacoes)}</td></tr>
         <tr><td>Satisfação (soma)</td><td class="val">${brl(c.valorSatisfacao)}</td></tr>
-        <tr><td>NPS (soma)</td><td class="val">${brl(c.valorNPS)}</td></tr>
+        <tr><td>NPS / Taxa de Resolução (soma)</td><td class="val">${brl(c.valorNPS)}</td></tr>
         <tr><td>Ajuste de monitoria (soma)</td><td class="val ${c.monitoriaAjuste<0?'neg':c.monitoriaAjuste>0?'pos':''}">${brl(c.monitoriaAjuste)}</td></tr>
         <tr><td>Retenções (soma)</td><td class="val pos">${brl(c.valorRetencao)}</td></tr>
         <tr><td>Superação de meta (soma)</td><td class="val pos">${brl(c.valorSuperacao)}</td></tr>
@@ -944,13 +966,16 @@ function renderAdminView(){
 
   let trs = "";
   rows.slice().sort((a,b)=> b.calc.total - a.calc.total).forEach(r=>{
+    const quartoIndicadorTxt = r.calc.novaRegra
+      ? r.taxaResolucao.toFixed(1)+"% <span class=\"muted-tag\">Resolução</span>"
+      : r.nps.toFixed(1)+" <span class=\"muted-tag\">NPS</span>";
     trs += `<tr class="${r.calc.eligible?'':'ineligible'}">
       <td>${r.nome}</td>
       <td>${fmtCiclo(r.ciclo)}</td>
       <td>${(r.calc.pctPontuacao*100).toFixed(0)}%</td>
       <td>${(r.calc.pctLigacoes*100).toFixed(0)}%</td>
       <td>${r.satisfacao.toFixed(1)}%</td>
-      <td>${r.nps.toFixed(1)}</td>
+      <td>${quartoIndicadorTxt}</td>
       <td>${r.monitoria.toFixed(1)}%</td>
       <td>${r.retencoes.toFixed(0)}</td>
       <td>${r.calc.eligible ? '<span class="pill yes">Sim</span>' : '<span class="pill no">Não</span>'}</td>
@@ -964,7 +989,7 @@ function renderAdminView(){
       <div class="data-table-wrap">
         <table class="data">
           <thead><tr>
-            <th>Nome</th><th>Ciclo</th><th>Pontuação</th><th>Ligações</th><th>Satisfação</th><th>NPS</th><th>Monitoria</th><th>Retenções</th><th>Elegível</th><th>Total</th>
+            <th>Nome</th><th>Ciclo</th><th>Pontuação</th><th>Ligações</th><th>Satisfação</th><th>NPS / Resolução</th><th>Monitoria</th><th>Retenções</th><th>Elegível</th><th>Total</th>
           </tr></thead>
           <tbody>${trs || '<tr><td colspan="10" style="padding:20px;color:var(--ink-faint)">Nenhum registro encontrado.</td></tr>'}</tbody>
         </table>
