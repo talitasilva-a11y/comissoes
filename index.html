@@ -8,6 +8,7 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 <style>
 /* ===================== DESIGN TOKENS ===================== */
 :root{
@@ -280,6 +281,7 @@ footer.foot{text-align:center;color:var(--ink-faint);font-size:12px;padding:20px
       <input class="text-input" id="adminSearch" placeholder="Buscar colaborador...">
       <div class="spacer"></div>
       <button class="btn secondary" id="adminRefreshBtn">Atualizar dados</button>
+      <button class="btn orange" id="adminExportPdfBtn">Exportar PDF (DP)</button>
       <a class="btn secondary" id="adminOpenSheetBtn" href="#" target="_blank" rel="noopener">Abrir planilha</a>
     </div>
     <div id="adminContent"></div>
@@ -946,11 +948,405 @@ function populateAdminCycleSelect(){
   });
   sel.onchange = renderAdminView;
 }
-function renderAdminView(){
+/* ============================================================
+   EXPORTAÇÃO EM PDF (Resumo + Extrato individual para o DP)
+   ============================================================ */
+const PDF_COMPANY_NAME = "AGILITY SOLUCOES EM TELEMETRIA E GESTAO DE FROTAS LTDA";
+const PDF_COLORS = {
+  ink:        [28,31,38],
+  inkFaint:   [86,92,107],
+  inkBandTxt: [190,192,199],
+  purple:     [112,99,240],
+  purpleDeep: [68,58,158],
+  orange:     [255,112,41],
+  orangeDark: [232,90,26],
+  surface2:   [236,234,249],
+  line:       [227,225,243],
+  danger:     [229,72,77],
+  white:      [255,255,255]
+};
+function pdfFill(doc,c){ doc.setFillColor(c[0],c[1],c[2]); }
+function pdfTextColor(doc,c){ doc.setTextColor(c[0],c[1],c[2]); }
+function pdfDrawColor(doc,c){ doc.setDrawColor(c[0],c[1],c[2]); }
+
+function pdfGetLogoSrc(){
+  const img = document.querySelector("#adminScreen .app-header img.logo");
+  return img ? img.src : null;
+}
+
+// Descreve o período coberto pelos registros exportados (usa os ciclos já presentes nos dados)
+function pdfDescreverPeriodo(rows){
+  const ciclos = Array.from(new Set(rows.map(r=>r.ciclo))).sort((a,b)=>cicloSortKey(a).localeCompare(cicloSortKey(b)));
+  if(ciclos.length === 0) return "—";
+  if(ciclos.length === 1) return "Ciclo: " + fmtCiclo(ciclos[0]);
+  return "Ciclos: " + fmtCiclo(ciclos[0]) + "  até  " + fmtCiclo(ciclos[ciclos.length-1]);
+}
+
+// Desenha o cabeçalho de marca (logo + nome da empresa + título/subtítulo) no topo da página atual
+function pdfDrawHeader(doc, logoSrc, title, subtitle){
+  const pw = doc.internal.pageSize.getWidth();
+  const margin = 30;
+  const bandH = 58;
+  pdfFill(doc, PDF_COLORS.ink); doc.rect(0,0,pw,bandH,"F");
+  pdfFill(doc, PDF_COLORS.orange); doc.rect(0,bandH,pw,3,"F");
+
+  if(logoSrc){
+    try{
+      const props = doc.getImageProperties(logoSrc);
+      const logoH = 20;
+      const logoW = props.width / props.height * logoH;
+      doc.addImage(logoSrc, "PNG", margin, 10, logoW, logoH);
+    }catch(e){ /* se a imagem não puder ser lida, segue sem logo */ }
+  }
+  pdfTextColor(doc, PDF_COLORS.inkBandTxt);
+  doc.setFont("helvetica","bold"); doc.setFontSize(6.6);
+  doc.text(PDF_COMPANY_NAME, margin, bandH - 8);
+
+  pdfTextColor(doc, PDF_COLORS.white);
+  doc.setFont("helvetica","bold"); doc.setFontSize(12.5);
+  doc.text(title, pw - margin, 24, {align:"right"});
+  doc.setFont("helvetica","normal"); doc.setFontSize(8.3);
+  pdfTextColor(doc, PDF_COLORS.inkBandTxt);
+  doc.text(subtitle, pw - margin, 39, {align:"right"});
+
+  return bandH + 3;
+}
+
+function pdfFooter(doc, pageLabel){
+  const pw = doc.internal.pageSize.getWidth();
+  const ph = doc.internal.pageSize.getHeight();
+  pdfDrawColor(doc, PDF_COLORS.line);
+  doc.setLineWidth(0.6);
+  doc.line(30, ph-28, pw-30, ph-28);
+  pdfTextColor(doc, PDF_COLORS.inkFaint);
+  doc.setFont("helvetica","normal"); doc.setFontSize(7.3);
+  const agora = new Date();
+  const dataGeracao = agora.toLocaleDateString("pt-BR") + " às " + agora.toLocaleTimeString("pt-BR",{hour:"2-digit",minute:"2-digit"});
+  doc.text("Documento gerado automaticamente pelo Painel de Comissionamento · " + dataGeracao, 30, ph-16);
+  if(pageLabel) doc.text(pageLabel, pw-30, ph-16, {align:"right"});
+}
+
+/* -------- Página(s) de resumo -------- */
+function pdfDrawResumo(doc, logoSrc, rows, periodo){
+  const margin = 30;
+  const pw = doc.internal.pageSize.getWidth();
+  const ph = doc.internal.pageSize.getHeight();
+  const totalComissao = rows.reduce((s,r)=>s+r.calc.total,0);
+  const elegiveis = rows.filter(r=>r.calc.eligible).length;
+  const inelegiveis = rows.length - elegiveis;
+
+  let y = pdfDrawHeader(doc, logoSrc, "RESUMO DE COMISSÕES", "Equipe de Contas a Receber  ·  " + periodo);
+
+  // cartões de resumo
+  y += 14;
+  const cardW = (pw - margin*2 - 3*10) / 4;
+  const cards = [
+    ["Colaboradores", String(new Set(rows.map(r=>r.pin)).size)],
+    ["Comissão total", brl(totalComissao)],
+    ["Elegíveis", String(elegiveis)],
+    ["Inelegíveis", String(inelegiveis)]
+  ];
+  cards.forEach((c,i)=>{
+    const x = margin + i*(cardW+10);
+    pdfFill(doc, PDF_COLORS.surface2);
+    doc.roundedRect(x, y, cardW, 40, 5, 5, "F");
+    pdfTextColor(doc, PDF_COLORS.inkFaint);
+    doc.setFont("helvetica","bold"); doc.setFontSize(6.8);
+    doc.text(c[0].toUpperCase(), x+10, y+14);
+    pdfTextColor(doc, PDF_COLORS.purpleDeep);
+    doc.setFont("helvetica","bold"); doc.setFontSize(13);
+    doc.text(c[1], x+10, y+31);
+  });
+  y += 40 + 18;
+
+  // tabela
+  const cols = [
+    {label:"Nome",              width:132, key:r=>r.nome},
+    {label:"Ciclo",             width:118, key:r=>fmtCiclo(r.ciclo)},
+    {label:"Pontuação",         width:58,  key:r=>(r.calc.pctPontuacao*100).toFixed(0)+"%"},
+    {label:"Ligações",          width:58,  key:r=>(r.calc.pctLigacoes*100).toFixed(0)+"%"},
+    {label:"Satisfação",        width:58,  key:r=>r.satisfacao.toFixed(1)+"%"},
+    {label:"NPS/Resolução",     width:78,  key:r=>r.calc.novaRegra ? r.taxaResolucao.toFixed(1)+"%" : r.nps.toFixed(1)},
+    {label:"Monitoria",         width:58,  key:r=>r.monitoria.toFixed(1)+"%"},
+    {label:"Retenções",         width:52,  key:r=>r.retencoes.toFixed(0)},
+    {label:"Elegível",          width:52,  key:r=>r.calc.eligible?"Sim":"Não"},
+    {label:"Valor a pagar",     width:80,  key:r=>brl(r.calc.total)}
+  ];
+  const tableW = cols.reduce((s,c)=>s+c.width,0);
+  const tableX = margin;
+  const rowH = 19, headH = 22;
+
+  function drawTableHeader(yy){
+    pdfFill(doc, PDF_COLORS.ink);
+    doc.rect(tableX, yy, tableW, headH, "F");
+    pdfTextColor(doc, PDF_COLORS.white);
+    doc.setFont("helvetica","bold"); doc.setFontSize(7.6);
+    let x = tableX;
+    cols.forEach(c=>{
+      doc.text(c.label, x+6, yy+headH/2+2.6);
+      x += c.width;
+    });
+    return yy + headH;
+  }
+
+  y = drawTableHeader(y);
+  let sortedRows = rows.slice().sort((a,b)=> b.calc.total - a.calc.total);
+  let pageNum = 1;
+  const totalEstimatedPages = Math.max(1, Math.ceil(sortedRows.length / 24)); // aproximação p/ rótulo
+
+  sortedRows.forEach((r,idx)=>{
+    if(y + rowH > ph - 34){
+      pdfFooter(doc, "Resumo · página " + pageNum);
+      doc.addPage();
+      pageNum++;
+      y = pdfDrawHeader(doc, logoSrc, "RESUMO DE COMISSÕES (continuação)", "Equipe de Contas a Receber  ·  " + periodo);
+      y += 12;
+      y = drawTableHeader(y);
+    }
+    const zebra = idx % 2 === 1;
+    pdfFill(doc, zebra ? [246,245,252] : [255,255,255]);
+    doc.rect(tableX, y, tableW, rowH, "F");
+    pdfDrawColor(doc, PDF_COLORS.line); doc.setLineWidth(0.4);
+    doc.line(tableX, y+rowH, tableX+tableW, y+rowH);
+
+    let x = tableX;
+    doc.setFont("helvetica","normal"); doc.setFontSize(7.6);
+    cols.forEach(c=>{
+      if(c.label === "Elegível"){
+        pdfTextColor(doc, r.calc.eligible ? PDF_COLORS.purpleDeep : PDF_COLORS.danger);
+        doc.setFont("helvetica","bold");
+      } else if(c.label === "Valor a pagar"){
+        pdfTextColor(doc, PDF_COLORS.ink);
+        doc.setFont("helvetica","bold");
+      } else {
+        pdfTextColor(doc, PDF_COLORS.ink);
+        doc.setFont("helvetica","normal");
+      }
+      let txt = String(c.key(r));
+      const maxW = c.width - 10;
+      txt = doc.splitTextToSize(txt, maxW)[0] || txt;
+      doc.text(txt, x+6, y+rowH/2+2.6);
+      x += c.width;
+    });
+    y += rowH;
+  });
+
+  pdfFooter(doc, "Resumo · página " + pageNum);
+}
+
+/* -------- Extrato individual (uma página por colaborador/ciclo) -------- */
+function pdfDrawExtrato(doc, logoSrc, r, periodo, indexAtual, totalRegistros){
+  const margin = 30;
+  const pw = doc.internal.pageSize.getWidth();
+  let y = pdfDrawHeader(doc, logoSrc, "EXTRATO DE COMISSÃO", "Equipe de Contas a Receber  ·  " + periodo);
+  const c = r.calc;
+
+  y += 22;
+  pdfTextColor(doc, PDF_COLORS.inkFaint);
+  doc.setFont("helvetica","bold"); doc.setFontSize(7);
+  doc.text("COLABORADOR", margin, y);
+  y += 15;
+  pdfTextColor(doc, PDF_COLORS.ink);
+  doc.setFont("helvetica","bold"); doc.setFontSize(15);
+  doc.text(r.nome, margin, y);
+
+  // selo de elegibilidade
+  const badgeTxt = c.eligible ? "ELEGÍVEL" : "NÃO ELEGÍVEL";
+  doc.setFont("helvetica","bold"); doc.setFontSize(8.5);
+  const badgeW = doc.getTextWidth(badgeTxt) + 18;
+  const badgeX = pw - margin - badgeW;
+  pdfFill(doc, c.eligible ? PDF_COLORS.purple : PDF_COLORS.danger);
+  doc.roundedRect(badgeX, y-13, badgeW, 18, 9, 9, "F");
+  pdfTextColor(doc, PDF_COLORS.white);
+  doc.text(badgeTxt, badgeX + badgeW/2, y-1, {align:"center"});
+
+  y += 8;
+  pdfTextColor(doc, PDF_COLORS.inkFaint);
+  doc.setFont("helvetica","normal"); doc.setFontSize(9);
+  doc.text("Ciclo: " + fmtCiclo(r.ciclo), margin, y+10);
+  y += 20;
+
+  if(!c.eligible && c.reasons && c.reasons.length){
+    pdfFill(doc, [253,235,236]);
+    const boxH = 14 + c.reasons.length*13;
+    doc.roundedRect(margin, y, pw-margin*2, boxH, 5, 5, "F");
+    pdfTextColor(doc, PDF_COLORS.danger);
+    doc.setFont("helvetica","bold"); doc.setFontSize(8);
+    doc.text("Motivo(s) de inelegibilidade:", margin+10, y+13);
+    doc.setFont("helvetica","normal");
+    c.reasons.forEach((m,i)=>{
+      doc.text("• " + m, margin+14, y+13+ (i+1)*13);
+    });
+    y += boxH + 16;
+  } else {
+    y += 8;
+  }
+
+  // ---- Tabela de critérios ----
+  pdfTextColor(doc, PDF_COLORS.ink);
+  doc.setFont("helvetica","bold"); doc.setFontSize(10.5);
+  doc.text("Critérios do ciclo", margin, y);
+  y += 10;
+
+  const rotuloQuarto = c.novaRegra ? "Taxa de Resolução" : "NPS";
+  const quartoValor = c.novaRegra ? r.taxaResolucao.toFixed(1)+"%" : r.nps.toFixed(1);
+  const quartoMeta = c.novaRegra ? ">= 90%" : ">= 4,0";
+  const quartoAtingiu = c.novaRegra ? (r.taxaResolucao>=CONFIG.LIMIARES.TAXA_RESOLUCAO_MIN) : (r.nps>=CONFIG.LIMIARES.NPS_MIN);
+
+  const criterios = [
+    ["Pontuação", r.pontuacaoAtingida.toFixed(1)+" / "+c.metaPontuacaoProp.toFixed(1), "Meta >= 100%", c.pctPontuacao>=1],
+    ["Ligações (>40s)", r.ligacoesAtingida.toFixed(0)+" / "+c.metaLigacoesProp.toFixed(0), "Meta >= 100%", c.pctLigacoes>=1],
+    ["Satisfação", r.satisfacao.toFixed(1)+"%", "Meta >= 90%", r.satisfacao>=CONFIG.LIMIARES.SATISFACAO_MIN],
+    [rotuloQuarto, quartoValor, "Meta "+quartoMeta, quartoAtingiu],
+    ["Monitoria", r.monitoria.toFixed(1)+"%", "Bônus/penalidade por faixa", null],
+    ["Retenções", r.retencoes.toFixed(0)+" un.", brl(CONFIG.VALORES.RETENCAO)+" por retenção", null],
+    ["Dias trabalhados / Faltas", r.diasTrabalhados+" dias / "+r.faltas+" falta(s)", "Máx. "+CONFIG.MAX_FALTAS_TOLERADAS+" falta(s) tolerada(s)", r.faltas <= CONFIG.MAX_FALTAS_TOLERADAS]
+  ];
+
+  const colW = [150, 155, 150, 65];
+  const tableX = margin;
+  const rowH = 18, headH = 18;
+  pdfFill(doc, PDF_COLORS.surface2);
+  doc.rect(tableX, y, colW.reduce((a,b)=>a+b,0), headH, "F");
+  pdfTextColor(doc, PDF_COLORS.purpleDeep);
+  doc.setFont("helvetica","bold"); doc.setFontSize(7.6);
+  let hx = tableX;
+  ["Critério","Resultado","Meta","Atingiu?"].forEach((label,i)=>{
+    doc.text(label, hx+6, y+headH/2+2.6);
+    hx += colW[i];
+  });
+  y += headH;
+
+  criterios.forEach((row,i)=>{
+    const zebra = i%2===1;
+    pdfFill(doc, zebra ? [246,245,252] : [255,255,255]);
+    doc.rect(tableX, y, colW.reduce((a,b)=>a+b,0), rowH, "F");
+    pdfDrawColor(doc, PDF_COLORS.line); doc.setLineWidth(0.4);
+    doc.line(tableX, y+rowH, tableX+colW.reduce((a,b)=>a+b,0), y+rowH);
+    let cx = tableX;
+    doc.setFont("helvetica","normal"); doc.setFontSize(7.8);
+    for(let k=0;k<3;k++){
+      pdfTextColor(doc, PDF_COLORS.ink);
+      doc.text(String(row[k]), cx+6, y+rowH/2+2.6);
+      cx += colW[k];
+    }
+    if(row[3] === null){
+      pdfTextColor(doc, PDF_COLORS.inkFaint);
+      doc.text("—", cx+6, y+rowH/2+2.6);
+    } else {
+      pdfTextColor(doc, row[3] ? PDF_COLORS.purpleDeep : PDF_COLORS.danger);
+      doc.setFont("helvetica","bold");
+      doc.text(row[3] ? "Sim" : "Não", cx+6, y+rowH/2+2.6);
+    }
+    y += rowH;
+  });
+
+  y += 22;
+
+  // ---- Composição financeira ----
+  pdfTextColor(doc, PDF_COLORS.ink);
+  doc.setFont("helvetica","bold"); doc.setFontSize(10.5);
+  doc.text("Composição da comissão", margin, y);
+  y += 10;
+
+  const linhasFin = [
+    ["Pontuação", c.valorPontuacao],
+    ["Ligações", c.valorLigacoes],
+    ["Satisfação", c.valorSatisfacao],
+    [rotuloQuarto, c.valorNPS],
+    ["Ajuste de monitoria", c.monitoriaAjuste],
+    ["Retenções", c.valorRetencao],
+    ["Superação de meta", c.valorSuperacao]
+  ];
+  const finW = pw - margin*2;
+  linhasFin.forEach((row,i)=>{
+    const zebra = i%2===1;
+    pdfFill(doc, zebra ? [246,245,252] : [255,255,255]);
+    doc.rect(tableX, y, finW, rowH, "F");
+    pdfDrawColor(doc, PDF_COLORS.line); doc.setLineWidth(0.4);
+    doc.line(tableX, y+rowH, tableX+finW, y+rowH);
+    pdfTextColor(doc, PDF_COLORS.ink);
+    doc.setFont("helvetica","normal"); doc.setFontSize(8.3);
+    doc.text(row[0], tableX+8, y+rowH/2+2.8);
+    const val = row[1];
+    pdfTextColor(doc, val<0 ? PDF_COLORS.danger : PDF_COLORS.ink);
+    doc.text(brl(val), tableX+finW-8, y+rowH/2+2.8, {align:"right"});
+    y += rowH;
+  });
+
+  const totalH = 24;
+  pdfFill(doc, PDF_COLORS.purpleDeep);
+  doc.rect(tableX, y, finW, totalH, "F");
+  pdfTextColor(doc, PDF_COLORS.white);
+  doc.setFont("helvetica","bold"); doc.setFontSize(11);
+  doc.text("TOTAL DO CICLO", tableX+8, y+totalH/2+3.5);
+  doc.text(brl(c.total), tableX+finW-8, y+totalH/2+3.5, {align:"right"});
+  y += totalH + 34;
+
+  // ---- Assinaturas ----
+  const sigW = (finW - 20) / 2;
+  pdfDrawColor(doc, PDF_COLORS.inkFaint); doc.setLineWidth(0.6);
+  doc.line(tableX, y, tableX+sigW, y);
+  doc.line(tableX+sigW+20, y, tableX+sigW+20+sigW, y);
+  pdfTextColor(doc, PDF_COLORS.inkFaint);
+  doc.setFont("helvetica","normal"); doc.setFontSize(7.6);
+  doc.text("Aprovação · RH / Financeiro", tableX, y+11);
+  doc.text("Colaborador (recebimento)", tableX+sigW+20, y+11);
+
+  pdfFooter(doc, "Extrato " + indexAtual + " de " + totalRegistros);
+}
+
+function exportAdminPdf(){
+  if(!(window.jspdf && window.jspdf.jsPDF)){
+    alert("Não foi possível carregar o gerador de PDF (biblioteca jsPDF). Verifique sua conexão e tente novamente.");
+    return;
+  }
+  const rows = getAdminFilteredRows();
+  if(rows.length === 0){
+    alert("Não há registros para exportar com os filtros atuais.");
+    return;
+  }
+  const logoSrc = pdfGetLogoSrc();
+  const periodo = pdfDescreverPeriodo(rows);
+  const { jsPDF } = window.jspdf;
+
+  const btn = document.getElementById("adminExportPdfBtn");
+  const originalTxt = btn ? btn.textContent : null;
+  if(btn){ btn.disabled = true; btn.textContent = "Gerando PDF..."; }
+
+  try{
+    // Página(s) de resumo — paisagem, para caber todas as colunas
+    const docResumo = new jsPDF({orientation:"landscape", unit:"pt", format:"a4"});
+    pdfDrawResumo(docResumo, logoSrc, rows, periodo);
+
+    // Extratos individuais — retrato, um por colaborador/ciclo
+    const sortedRows = rows.slice().sort((a,b)=> normKey(a.nome).localeCompare(normKey(b.nome)) || cicloSortKey(a.ciclo).localeCompare(cicloSortKey(b.ciclo)));
+    const docExtratos = new jsPDF({orientation:"portrait", unit:"pt", format:"a4"});
+    sortedRows.forEach((r,i)=>{
+      if(i>0) docExtratos.addPage();
+      pdfDrawExtrato(docExtratos, logoSrc, r, periodo, i+1, sortedRows.length);
+    });
+
+    const stamp = new Date().toISOString().slice(0,10);
+    docResumo.save("Comissoes-Resumo-" + stamp + ".pdf");
+    docExtratos.save("Comissoes-Extratos-Individuais-" + stamp + ".pdf");
+  } catch(e){
+    console.error(e);
+    alert("Ocorreu um erro ao gerar o PDF: " + e.message);
+  } finally {
+    if(btn){ btn.disabled = false; btn.textContent = originalTxt; }
+  }
+}
+
+function getAdminFilteredRows(){
   const cicloSel = document.getElementById("adminCycleSelect").value;
   const search = normKey(document.getElementById("adminSearch").value);
   let rows = RAW_ROWS.filter(r => cicloSel==="__all__" || r.ciclo===cicloSel);
   if(search) rows = rows.filter(r => normKey(r.nome).includes(search));
+  return rows;
+}
+function renderAdminView(){
+  const rows = getAdminFilteredRows();
 
   const totalComissao = rows.reduce((s,r)=>s+r.calc.total,0);
   const elegiveis = rows.filter(r=>r.calc.eligible).length;
@@ -1010,6 +1406,7 @@ function refreshCurrentView(){
 document.getElementById("agentLogout").onclick = logout;
 document.getElementById("adminLogout").onclick = logout;
 document.getElementById("adminRefreshBtn").onclick = loadData;
+document.getElementById("adminExportPdfBtn").onclick = exportAdminPdf;
 document.getElementById("adminSearch").oninput = renderAdminView;
 document.getElementById("setupSaveBtn").onclick = ()=>{
   const v = document.getElementById("setupCsvInput").value.trim();
